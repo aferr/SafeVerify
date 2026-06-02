@@ -1,0 +1,10 @@
+Currently running on Lean v4.27.0
+Running SafeVerify on target file: SafeVerifyTest/BvDecide/Target.olean and submission file: SafeVerifyTest/BvDecide/Bad.olean.
+------------------
+Replaying SafeVerifyTest/BvDecide/Target.olean
+Finished setting up the environment.
+Finished replay. Found 1 declarations.
+------------------
+Replaying SafeVerifyTest/BvDecide/Bad.olean
+Finished setting up the environment.
+uncaught exception: (kernel) (interpreter) unknown declaration 'bitvec_and_mask._reflection_def_1_1'
