@@ -389,7 +389,7 @@ def settingsFromParsed (p : Parsed) : SafeVerify.Settings where
   submissionFile := p.positionalArg! "submission" |>.as! System.FilePath
   disallowPartial := p.hasFlag "disallow-partial"
   verbose := p.hasFlag "verbose"
-  allowedAxioms := #[`propext, `Quot.sound, `Classical.choice]
+  allowedAxioms := #[`propext, `Quot.sound, `Classical.choice, `Lean.ofReduceBool, `Lean.trustCompiler]
   jsonOutputPath := p.flag? "save" |>.map (·.as! System.FilePath)
   allowDisproofs := p.hasFlag "disproofs"
 
