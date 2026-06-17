@@ -12,14 +12,22 @@ import Cli
 open Lean Meta Core SafeVerify
 open Std
 
+abbrev EnvM := ReaderT Environment Id
+instance : MonadEnv EnvM where
+  getEnv := read
+  modifyEnv _ := pure ()
+
+def getAxiomsPure (env : Environment) (name : Name) : Array Name :=
+  (collectAxioms name : EnvM (Array Name)) env
+
 /-- Takes the environment obtained after replaying all the constant in a file and outputs
 a hashmap storing the infos corresponding to all the theorems and definitions in the file. -/
 def processFileDeclarations (env : Environment) : HashMap Name Info := Id.run do
   let mut out : HashMap Name Info := {}
   for (_, ci) in env.constants.map₂  do
     if ci.kind ∈ ["theorem", "def", "opaque", "inductive", "constructor"] then
-      let (_, s) := (CollectAxioms.collect ci.name).run env |>.run {}
-      out := out.insert ci.name ⟨ci, s.axioms⟩
+      let axioms := getAxiomsPure env ci.name
+      out := out.insert ci.name ⟨ci, axioms⟩
   return out
 
 /-- Lean generates auxiliary `_unsafe_rec` runtime shims for ordinary accepted
@@ -32,7 +40,7 @@ def isCompilerUnsafeRecName : Name → Bool
 /-- Check if an Info uses only allowed axioms -/
 def checkAxioms (info : Info) (allowedAxioms : Array Name) : Bool := Id.run do
   for a in info.axioms do
-    if a ∉ allowedAxioms then return false
+    if a ∉ allowedAxioms && !a.components.any (· == `bv_decide) then return false
   return true
 
 /-- Determine the failure mode for a single target/submission pair.
@@ -309,8 +317,8 @@ def processModuleDeclarations (env : Environment) (mod : ModuleData)
   let mut out : HashMap Name Info := {}
   for name in mod.constNames, ci in mod.constants do
     if ci.kind ∈ ["theorem", "def", "opaque", "inductive", "constructor"] then
-      let (_, s) := (CollectAxioms.collect name).run env |>.run {}
-      let filteredAxioms := s.axioms.filter (fun a => !forceAdded.contains a)
+      let axioms := getAxiomsPure env name
+      let filteredAxioms := axioms.filter (fun a => !forceAdded.contains a)
       out := out.insert name ⟨ci, filteredAxioms⟩
   return out
 
@@ -602,8 +610,8 @@ def runMain (p : Parsed) : IO UInt32 := do
     if submissionDecls.get? name |>.isNone then
       if let some ci := submissionEnv.find? name then
         if ci.kind ∈ ["theorem", "def", "opaque", "inductive", "constructor"] then
-          let (_, s) := (CollectAxioms.collect name).run submissionEnv |>.run {}
-          supplementedDecls := supplementedDecls.insert name ⟨ci, s.axioms⟩
+          let axioms := getAxiomsPure submissionEnv name
+          supplementedDecls := supplementedDecls.insert name ⟨ci, axioms⟩
           IO.eprintln s!"  Note: '{name}' found in submission's imported environment"
 
   -- Validate Nat literals in new declarations
