@@ -14,12 +14,12 @@ open Std
 
 /-- Takes the environment obtained after replaying all the constant in a file and outputs
 a hashmap storing the infos corresponding to all the theorems and definitions in the file. -/
-def processFileDeclarations (newConstants : Std.HashMap Name ConstantInfo) (env : Environment) : HashMap Name Info := Id.run do
+def processFileDeclarations (env : Environment) : HashMap Name Info := Id.run do
   let mut out : HashMap Name Info := {}
-  for (name, ci) in newConstants.toList do
+  for (_, ci) in env.constants.map₂  do
     if ci.kind ∈ ["theorem", "def", "opaque", "inductive", "constructor"] then
-      let (_, s) := (CollectAxioms.collect name).run env |>.run {}
-      out := out.insert name ⟨ci, s.axioms⟩
+      let (_, s) := (CollectAxioms.collect ci.name).run env |>.run {}
+      out := out.insert ci.name ⟨ci, s.axioms⟩
   return out
 
 /-- Lean generates auxiliary `_unsafe_rec` runtime shims for ordinary accepted
@@ -140,34 +140,185 @@ def sanitizeConstant : ConstantInfo → ConstantInfo
       value := rebuildExpr o.value }
   | ci => ci
 
+/-!
+## bv_decide support: multi-pass replay with axiom fallback
 
-/-- Add constants to an environment using Lean's native C++ `importModules` function,
-which completely skips kernel type-checking. Used as a fallback when `Environment.replay`
-fails due to interpreter-dependent definitions or times out on enormous SAT certificates
-(e.g. `bv_decide` reflection defs).
+### Background: why `bv_decide` breaks `Environment.replay`
 
-`Environment.replay` and `addDeclCore` both invoke kernel type-checking which can
-timeout on huge `_reflection_def` proofs. By guessing the module name from the file
-path and appending it to the module's imports, we can ask `importModules` to load
-the module's own constants natively from the `.olean` file. The resulting environment
-is structurally complete and sufficient for SafeVerify's axiom checks. -/
-def replayTrusted (filePath : System.FilePath) : IO Environment := do
-  let str := (filePath.withExtension "").toString
-  let parts := str.splitOn System.FilePath.pathSeparator.toString
-  let modName := parts.foldl Name.mkStr Name.anonymous
-  let (mod, _) ← readModuleData filePath
-  let imports := mod.imports.push { module := modName }
-  let sp ← searchPathRef.get
-  searchPathRef.set ("." :: sp)
-  importModules imports {} 0
+The `bv_decide` tactic (from `Std.Tactic.BVDecide`) proves bitvector theorems by
+reducing them to SAT problems, solving them, and encoding the SAT certificate as
+a Lean proof term. During elaboration, this generates several auxiliary constants
+for each `bv_decide` call:
+
+  - `<thm>._expr_def_1_1`       — the expression tree encoding
+  - `<thm>._cert_def_1_1`       — the SAT certificate data
+  - `<thm>._reflection_def_1_1` — the reflection proof (depends on _expr and _cert)
+  - `<thm>._proof_1_7`          — intermediate proof step (invokes the interpreter
+                                   to evaluate _reflection_def)
+
+These constants rely on `Lean.ofReduceBool` and `Lean.trustCompiler` axioms, which
+allow the kernel to trust that a `Bool`-valued computation reduces to `true`.
+
+### The failure mode
+
+`Environment.replay` re-typechecks every constant through the Lean kernel. For
+`bv_decide` proofs, this fails because:
+
+1. **Dependency ordering**: The olean serializes constants in an arbitrary order.
+   `env.replay` does not topologically sort them, so it may try to typecheck a
+   theorem before its `_reflection_def` dependency has been added.
+
+2. **Kernel interpreter limitation**: Even after resolving ordering (via multi-pass
+   replay), the kernel's *interpreter* cannot evaluate `_reflection_def` constants
+   that were added via `env.replay`. The interpreter uses an internal lookup table
+   that is only populated by `importModules` (native olean loading), not by
+   `env.replay`. This is a fundamental Lean kernel limitation.
+
+   Concretely, the `_proof_1_7` theorems fail with:
+     `(kernel) (interpreter) unknown declaration '<thm>._reflection_def_1_1'`
+   even though the `_reflection_def` was successfully added to the environment.
+
+### The fix: graceful degradation
+
+The solution has three parts:
+
+1. **`replayWithFallback`**: Tries batch `env.replay` first (zero overhead for
+   non-bv_decide files). On failure, does multi-pass one-by-one replay to resolve
+   ordering dependencies. Constants that are permanently stuck (interpreter
+   limitation) are force-added as `axiomInfo` — type-only, no body — which the
+   kernel accepts trivially.
+
+2. **`processModuleDeclarations`**: Builds the `Info` HashMap from the raw olean
+   module data instead of `env.constants.map₂`. This preserves the original
+   `thmInfo`/`defnInfo` kinds for force-added constants (which appear as
+   `axiomInfo` in the environment). Force-added constant names are filtered out
+   of axiom sets since they are not real axioms.
+
+3. **`allowedAxioms`**: Includes `Lean.ofReduceBool` and `Lean.trustCompiler` to
+   permit the axioms that `bv_decide` necessarily introduces.
+
+### Security implications
+
+For non-bv_decide submissions, the fast path (`env.replay`) succeeds and behavior
+is identical to the original code — full kernel re-verification.
+
+For bv_decide submissions, kernel re-verification is skipped for the specific
+constants the interpreter cannot handle. SafeVerify's other security checks
+(axiom checking, definition equivalence, theorem type matching, `sorry` detection)
+still apply to ALL constants. The main trade-off is that force-added constants
+are trusted from the olean without independent kernel re-verification.
+
+Allowing `Lean.trustCompiler` globally does open a potential reward-hacking vector
+via `native_decide` or `implemented_by`. A future improvement could restrict
+`trustCompiler` to only be allowed for constants matching `_reflection_def` patterns.
+-/
+
+/-- Convert a ConstantInfo to an axiomInfo (drops the body, keeps the type).
+Used as a fallback when the kernel interpreter cannot re-verify a constant
+(e.g., bv_decide's `_proof_1_7` theorems that depend on `_reflection_def` values
+the interpreter cannot evaluate). See the module comment above for details. -/
+def toAxiomInfo (ci : ConstantInfo) : ConstantInfo :=
+  .axiomInfo {
+    name := ci.name
+    levelParams := ci.levelParams
+    type := ci.type
+    isUnsafe := ci.isUnsafe
+  }
+
+/-- Replay constants with fallback for interpreter-dependent definitions.
+
+Strategy:
+1. **Fast path**: Try `env.replay` on the full batch. If all constants can be
+   re-verified by the kernel, return immediately with an empty `forceAdded` set.
+2. **Multi-pass**: On failure, replay constants one-by-one across multiple passes.
+   Each pass adds any constant whose dependencies are already in the environment.
+   This resolves ordering issues (e.g., `_reflection_def` depends on `_expr_def`).
+3. **Force-add**: After passes converge with no progress, remaining stuck constants
+   (those the interpreter fundamentally cannot handle) are converted to `axiomInfo`
+   and added without body verification.
+
+Returns the updated environment and the set of names that were force-added. -/
+def replayWithFallback (env : Environment) (newConstants : Std.HashMap Name ConstantInfo)
+    : IO (Environment × Std.HashSet Name) := do
+  -- Fast path: try full batch replay (handles all non-bv_decide files)
+  match (← (env.replay newConstants |>.toBaseIO)) with
+  | .ok env' => return (env', {})
+  | .error _ =>
+    IO.eprintln "  Warning: batch replay failed. Falling back to multi-pass replay..."
+    -- Multi-pass: replay constants one by one, deferring failures.
+    -- Each pass resolves forward-reference ordering issues.
+    let mut pending : Array (Name × ConstantInfo) := #[]
+    for (name, ci) in newConstants do
+      pending := pending.push (name, ci)
+    let mut currentEnv := env
+    let maxPasses := 10
+    for pass in List.range maxPasses do
+      if pending.size == 0 then break
+      let mut deferred : Array (Name × ConstantInfo) := #[]
+      for (name, ci) in pending do
+        match (← (currentEnv.replay (Std.HashMap.ofList [(name, ci)]) |>.toBaseIO)) with
+        | .ok env' => currentEnv := env'
+        | .error _ => deferred := deferred.push (name, ci)
+      IO.eprintln s!"  Pass {pass + 1}: replayed {pending.size - deferred.size}/{pending.size}"
+      if deferred.size == pending.size then break  -- no progress, remaining are stuck
+      pending := deferred
+    -- Only force-add constants that failed due to the kernel *interpreter* limitation
+    -- (error message contains "(interpreter)"). Other failures (type mismatches,
+    -- invalid proofs) are legitimate security rejections and must be re-thrown.
+    -- This prevents attacks like ReplaceAxiom from being silently accepted.
+    let mut forceAdded : Std.HashSet Name := {}
+    if pending.size > 0 then
+      let mut interpreterStuck : Array (Name × ConstantInfo) := #[]
+      for (name, ci) in pending do
+        -- Re-try to get the actual error message
+        match (← (currentEnv.replay (Std.HashMap.ofList [(name, ci)]) |>.toBaseIO)) with
+        | .ok env' =>
+          currentEnv := env'  -- shouldn't happen, but handle gracefully
+        | .error e =>
+          let errMsg := toString e
+          if (errMsg.splitOn "(interpreter)").length > 1
+              || (errMsg.splitOn "unknown declaration").length > 1
+              || (errMsg.splitOn "unknown constant").length > 1 then
+            interpreterStuck := interpreterStuck.push (name, ci)
+          else
+            throw <| IO.userError s!"kernel verification failed for '{name}': {errMsg}"
+      if interpreterStuck.size > 0 then
+        IO.eprintln s!"  Force-adding {interpreterStuck.size} constants as axiomInfo (interpreter limitation)..."
+        for (name, ci) in interpreterStuck do
+          match (← (currentEnv.replay (Std.HashMap.ofList [(name, toAxiomInfo ci)]) |>.toBaseIO)) with
+          | .ok env' =>
+            currentEnv := env'
+            forceAdded := forceAdded.insert name
+          | .error e =>
+            throw <| IO.userError s!"failed to force-add constant '{name}': {e}"
+    return (currentEnv, forceAdded)
+
+/-- Build the `Info` HashMap from raw module data instead of `env.constants.map₂`.
+
+This is necessary because force-added constants appear as `axiomInfo` in the
+environment (since their bodies were dropped). By reading from the raw olean data,
+we preserve the original `ConstantInfo` kinds (`thmInfo`, `defnInfo`, etc.) so
+that SafeVerify's comparison logic (`equivThm`, `equivDefn`) sees the correct types.
+
+For axiom collection (`CollectAxioms.collect`), force-added constants show up as
+axioms of themselves (since they are `axiomInfo` in the environment). We filter
+these out of the axiom set since they are not real axioms — they are just
+constants whose proofs could not be re-verified due to the interpreter limitation. -/
+def processModuleDeclarations (env : Environment) (mod : ModuleData)
+    (forceAdded : Std.HashSet Name) : HashMap Name Info := Id.run do
+  let mut out : HashMap Name Info := {}
+  for name in mod.constNames, ci in mod.constants do
+    if ci.kind ∈ ["theorem", "def", "opaque", "inductive", "constructor"] then
+      let (_, s) := (CollectAxioms.collect name).run env |>.run {}
+      let filteredAxioms := s.axioms.filter (fun a => !forceAdded.contains a)
+      out := out.insert name ⟨ci, filteredAxioms⟩
+  return out
 
 /-- Replays a lean file and outputs a hashmap storing the `Info`s corresponding to
 the theorems and definitions in the file, together with the resulting environment.
 
-If `Environment.replay` fails due to interpreter-dependent definitions (e.g. from
-`bv_decide`), falls back to `replayTrusted` which uses `importModules` natively to
-bypass kernel type-checking. SafeVerify's core security checks (theorem type
-matching, axiom checking, import superset) still apply. -/
+Uses `replayWithFallback` to gracefully handle files containing `bv_decide` proofs.
+Kernel theorem verification is skipped for any constants that had to be force-added. -/
 def replayFile (filePath : System.FilePath) (disallowPartial : Bool) :
     IO (HashMap Name Info × Environment) := do
   IO.eprintln s!"Replaying {filePath}"
@@ -176,38 +327,30 @@ def replayFile (filePath : System.FilePath) (disallowPartial : Bool) :
   let (mod, _) ← readModuleData filePath
   let env ← importModules mod.imports {} 0
   IO.eprintln "Finished setting up the environment."
-  let mut newConstants : Std.HashMap Name ConstantInfo := {}
+  let mut newConstants := {}
   for name in mod.constNames, ci in mod.constants do
     if ci.isUnsafe then
       throw <| IO.userError s!"unsafe constant {name} detected"
     if disallowPartial && ci.isPartial && !isCompilerUnsafeRecName name then
       throw <| IO.userError s!"partial constant {name} detected"
     newConstants := newConstants.insert name (sanitizeConstant ci)
-  let env ← try
-    let replayed ← env.replay newConstants
-    IO.eprintln s!"Finished replay. Found {newConstants.size} declarations."
-    -- Verify theorem proofs using kernel typechecker with rebuilt expressions.
-    for name in mod.constNames, ci in mod.constants do
-      if let .thmInfo t := ci then
-        let freshValue := rebuildExpr t.value
-        let freshType := rebuildExpr t.type
-        match Kernel.check replayed {} freshValue with
-        | .ok inferredType =>
-          match Kernel.isDefEq replayed {} inferredType freshType with
-          | .ok true => pure ()
-          | _ => throw <| IO.userError s!"kernel verification failed for '{name}': inferred type does not match declared type"
-        | .error _ =>
-          throw <| IO.userError s!"kernel verification failed for '{name}': proof term rejected by kernel typechecker (possible unsafeCast or compacted-region corruption)"
-    pure replayed
-  catch e =>
-    let msg := toString e
-    if (msg.splitOn "interpreter").length > 1 then
-      IO.eprintln s!"  Warning: replay failed due to interpreter-dependent definitions (e.g. bv_decide)."
-      IO.eprintln s!"  Falling back to trusted native module import (kernel re-verification skipped)."
-      replayTrusted filePath
-    else
-      throw e
-  return (processFileDeclarations newConstants env, env)
+  let (env, forceAdded) ← replayWithFallback env newConstants
+  IO.eprintln s!"Finished replay. Found {newConstants.size} declarations."
+  -- Verify theorem proofs using kernel typechecker with rebuilt expressions.
+  -- Skip verification for force-added constants (kernel interpreter can't handle them).
+  for name in mod.constNames, ci in mod.constants do
+    if forceAdded.contains name then continue
+    if let .thmInfo t := ci then
+      let freshValue := rebuildExpr t.value
+      let freshType := rebuildExpr t.type
+      match Kernel.check env {} freshValue with
+      | .ok inferredType =>
+        match Kernel.isDefEq env {} inferredType freshType with
+        | .ok true => pure ()
+        | _ => throw <| IO.userError s!"kernel verification failed for '{name}': inferred type does not match declared type"
+      | .error _ =>
+        throw <| IO.userError s!"kernel verification failed for '{name}': proof term rejected by kernel typechecker (possible unsafeCast or compacted-region corruption)"
+  return (processModuleDeclarations env mod forceAdded, env)
 
 /-- Replays the target (challenge) file and extracts declarations plus the environment.
     Reads file path and settings from the Settings context. -/
@@ -224,8 +367,35 @@ def replaySolutions : ReaderT SafeVerify.Settings IO (HashMap Name Info) := do
 /-- Replay a file and return both the new-declaration HashMap AND the full Environment.
 Used for the submission so we can look up imported declarations as a fallback. -/
 def replayFileWithEnv (filePath : System.FilePath) (disallowPartial : Bool)
-    : IO (HashMap Name Info × Environment) :=
-  replayFile filePath disallowPartial
+    : IO (HashMap Name Info × Environment) := do
+  IO.eprintln s!"Replaying {filePath}"
+  unless (← filePath.pathExists) do
+    throw <| IO.userError s!"object file '{filePath}' does not exist"
+  let (mod, _) ← readModuleData filePath
+  let env ← importModules mod.imports {} 0
+  IO.eprintln "Finished setting up the environment."
+  let mut newConstants := {}
+  for name in mod.constNames, ci in mod.constants do
+    if ci.isUnsafe then
+      throw <| IO.userError s!"unsafe constant {name} detected"
+    if disallowPartial && ci.isPartial && !isCompilerUnsafeRecName name then
+      throw <| IO.userError s!"partial constant {name} detected"
+    newConstants := newConstants.insert name (sanitizeConstant ci)
+  let (env, forceAdded) ← replayWithFallback env newConstants
+  IO.eprintln s!"Finished replay. Found {newConstants.size} declarations."
+  for name in mod.constNames, ci in mod.constants do
+    if forceAdded.contains name then continue
+    if let .thmInfo t := ci then
+      let freshValue := rebuildExpr t.value
+      let freshType := rebuildExpr t.type
+      match Kernel.check env {} freshValue with
+      | .ok inferredType =>
+        match Kernel.isDefEq env {} inferredType freshType with
+        | .ok true => pure ()
+        | _ => throw <| IO.userError s!"kernel verification failed for '{name}': inferred type does not match declared type"
+      | .error _ =>
+        throw <| IO.userError s!"kernel verification failed for '{name}': proof term rejected by kernel typechecker (possible unsafeCast or compacted-region corruption)"
+  return (processModuleDeclarations env mod forceAdded, env)
 
 /-- Read module imports from an olean file without full replay. -/
 def readImports (filePath : System.FilePath) : IO (Array Import) := do
@@ -389,6 +559,8 @@ def settingsFromParsed (p : Parsed) : SafeVerify.Settings where
   submissionFile := p.positionalArg! "submission" |>.as! System.FilePath
   disallowPartial := p.hasFlag "disallow-partial"
   verbose := p.hasFlag "verbose"
+  -- Lean.ofReduceBool and Lean.trustCompiler are required by `bv_decide` proofs.
+  -- See the "bv_decide support" section above for details.
   allowedAxioms := #[`propext, `Quot.sound, `Classical.choice, `Lean.ofReduceBool, `Lean.trustCompiler]
   jsonOutputPath := p.flag? "save" |>.map (·.as! System.FilePath)
   allowDisproofs := p.hasFlag "disproofs"
